@@ -1,521 +1,420 @@
-export default {
-  async fetch(req, env, ctx) {
-    const url = new URL(req.url);
+// ======================
+// TITAN VIP BOT - Cloudflare Worker
+// Token ONLY in webhook URL
+// ======================
 
-    // فقط همین مسیر وبهوک رو قبول می‌کنیم
-    if (url.pathname === "/telegram-webhook") {
-      const update = await req.json();
-      ctx.waitUntil(handleTelegram(update, env));
-      return new Response("ok");
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // ✅ امنیت: فقط اگر مسیر = /<TOKEN> باشد کار کن
+    // توکن از Cloudflare Variable میاد
+    const tokenPath = "/" + env.BOT_TOKEN;
+    if (url.pathname !== tokenPath) {
+      return new Response("not found", { status: 404 });
     }
 
-    return new Response("not found", { status: 404 });
+    if (request.method !== "POST") return new Response("ok");
+
+    let update;
+    try {
+      update = await request.json();
+    } catch {
+      return new Response("bad json", { status: 400 });
+    }
+
+    try {
+      if (update.message) {
+        await onMessage(update.message, env);
+      } else if (update.callback_query) {
+        await onCallback(update.callback_query, env);
+      }
+    } catch (e) {
+      console.log("ERR:", e?.message || e);
+    }
+
+    return new Response("ok");
   },
 
-  // کران (هر ۱ ساعت) — باید تو داشبورد Trigger event براش بذاری
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkExpiredSubs(env));
+    // فعلاً کاری نداره
   }
 };
 
-// ======================= Telegram Router =======================
-async function handleTelegram(update, env) {
-  try {
-    if (update.callback_query) return handleCallback(update.callback_query, env);
-    if (update.message) return handleMessage(update.message, env);
-    if (update.my_chat_member) return handleChatMember(update.my_chat_member, env);
-  } catch (e) {
-    // برای جلوگیری از خاموش شدن Worker
-    console.log("handleTelegram error:", e);
-  }
+// ----------------------
+// Telegram helpers
+// ----------------------
+
+const API = (env, method) =>
+  `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+
+async function tg(env, method, body) {
+  const res = await fetch(API(env, method), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return res.json();
 }
 
-// ======================= Message Handler =======================
-async function handleMessage(msg, env) {
-  await ensureTables(env);
-
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = (msg.text || "").trim();
-
-  // دستور start
-  if (text === "/start") {
-    await clearUserState(env, userId);
-    return showMainMenu(env, chatId);
-  }
-
-  // دریافت وضعیت استیت کاربر
-  const state = await getUserState(env, userId);
-
-  // اگر منتظر کد فعال‌سازی هستیم
-  if (state === "await_code") {
-    await clearUserState(env, userId);
-    return redeemCode(env, chatId, userId, text);
-  }
-
-  // اگر ادمین منتظر انتخاب روز هست
-  if (state === "admin_await_days") {
-    if (!isAdmin(env, userId)) return;
-
-    const days = parseInt(text, 10);
-    if (!Number.isFinite(days) || days <= 0 || days > 3650) {
-      return tgSendMessage(
-        env,
-        chatId,
-        "❌ عدد معتبر نیست. یک عدد بین 1 تا 3650 بفرست."
-      );
-    }
-
-    await clearUserState(env, userId);
-    return createCodeForAdmin(env, chatId, days);
-  }
-
-  // ======================= دکمه‌های منو =======================
-  switch (text) {
-    case "✅ فعال‌سازی اشتراک VIP":
-      await setUserState(env, userId, "await_code");
-      return tgSendMessage(
-        env,
-        chatId,
-        "🔑 لطفاً کد اشتراک ۳۰ کاراکتری رو ارسال کن:"
-      );
-
-    case "📌 وضعیت اشتراک من":
-      return showMyStatus(env, chatId, userId);
-
-    case "🧾 دریافت اشتراک کانال":
-      return sendMyInvite(env, chatId, userId);
-
-    case "👨‍💻 ارتباط با ادمین":
-      return contactAdmin(env, chatId);
-
-    case "🛠 ساخت کد جدید (ادمین)":
-      if (!isAdmin(env, userId)) {
-        return tgSendMessage(env, chatId, "⛔ فقط ادمین اجازه این بخش رو داره.");
-      }
-      return showAdminDaysMenu(env, chatId, userId);
-
-    case "🗑 حذف اشتراک":
-      return deleteMySubscription(env, chatId, userId);
-
-    case "🏠 منوی اصلی":
-      return showMainMenu(env, chatId);
-
-    default:
-      // اگر کاربر چیزی بی‌ربط زد
-      return tgSendMessage(env, chatId, "از منو استفاده کن 👇", mainMenuKeyboard());
-  }
+async function sendMessage(env, chat_id, text, extra = {}) {
+  return tg(env, "sendMessage", {
+    chat_id,
+    text,
+    parse_mode: "HTML",
+    ...extra
+  });
 }
 
-// ======================= Callback Handler =======================
-async function handleCallback(cb, env) {
-  await ensureTables(env);
-
-  const chatId = cb.message.chat.id;
-  const userId = cb.from.id;
-  const data = cb.data;
-
-  // جواب به callback برای حذف لودینگ تلگرام
-  await tgAnswerCallback(env, cb.id);
-
-  // انتخاب روزهای پیش‌فرض (ادمین)
-  if (data.startsWith("ADMIN_DAYS_")) {
-    if (!isAdmin(env, userId)) return;
-    const days = parseInt(data.replace("ADMIN_DAYS_", ""), 10);
-    return createCodeForAdmin(env, chatId, days);
-  }
-
-  // مدت دلخواه (ادمین)
-  if (data === "ADMIN_CUSTOM_DAYS") {
-    if (!isAdmin(env, userId)) return;
-    await setUserState(env, userId, "admin_await_days");
-    return tgSendMessage(env, chatId, "✍️ تعداد روز دلخواه رو فقط به صورت عدد بفرست.\nمثلاً: 45");
-  }
+function tehranNowFa() {
+  return new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
 }
 
-// ======================= Chat Member Handler =======================
-async function handleChatMember(chatMemberUpdate, env) {
-  const chatId = chatMemberUpdate.chat.id;
-
-  // فقط روی کانال VIP خودت
-  if (String(chatId) !== String(env.CHANNEL_ID)) return;
-
-  const newStatus = chatMemberUpdate.new_chat_member?.status;
-  const user = chatMemberUpdate.new_chat_member?.user;
-
-  if (newStatus === "member" && user) {
-    await tgSendMessage(
-      env,
-      user.id,
-      "✨ به ربات VIP کانال *TITAN X* خوش اومدی!\n\n" +
-        "اینجا می‌تونی:\n" +
-        "✅ اشتراکت رو فعال کنی\n" +
-        "📌 وضعیت اشتراکت رو ببینی\n" +
-        "🧾 لینک ورود کانال رو بگیری\n" +
-        "👨‍💻 با ادمین چت کنی\n\n" +
-        "از منوی زیر یکی رو انتخاب کن 👇",
-      mainMenuKeyboard(true)
-    );
-  }
-}
-
-// ======================= Menus =======================
-function mainMenuKeyboard(hideHome = false) {
-  const keyboard = [
-    ["✅ فعال‌سازی اشتراک VIP"],
-    ["📌 وضعیت اشتراک من"],
-    ["🧾 دریافت اشتراک کانال"],
-    ["👨‍💻 ارتباط با ادمین"],
-    ["🗑 حذف اشتراک"]
+function mainMenuKeyboard(isAdmin) {
+  const rows = [
+    [{ text: "✅ فعال سازی اشتراک VIP" }],
+    [{ text: "📌 وضعیت اشتراک من" }],
+    [{ text: "🧾 دریافت اشتراک کانال" }],
+    [{ text: "👨‍💻 ارتباط با ادمین" }]
   ];
 
-  // دکمه ادمین جدا
-  keyboard.push(["🛠 ساخت کد جدید (ادمین)"]);
-
-  if (!hideHome) keyboard.push(["🏠 منوی اصلی"]);
+  if (isAdmin) rows.push([{ text: "🛠 ساخت کد جدید (ادمین)" }]);
+  rows.push([{ text: "🗑 حذف اشتراک" }]);
 
   return {
-    reply_markup: {
-      keyboard,
-      resize_keyboard: true,
-      one_time_keyboard: false,
-      selective: false
-    }
+    keyboard: rows,
+    resize_keyboard: true
   };
 }
 
-async function showMainMenu(env, chatId) {
-  return tgSendMessage(
-    env,
-    chatId,
-    "✨ به ربات VIP کانال *TITAN X* خوش اومدی!\n\n" +
-      "اینجا می‌تونی:\n" +
-      "✅ کد اشتراک رو فعال کنی\n" +
-      "📌 وضعیت اشتراکت رو ببینی\n" +
-      "🧾 لینک ورود کانال رو بگیری\n" +
-      "👨‍💻 با ادمین چت کنی\n\n" +
-      "👇 از منو انتخاب کن:",
-    mainMenuKeyboard(true)
-  );
-}
-
-async function showAdminDaysMenu(env, chatId) {
-  const inline = {
+function durationKeyboard() {
+  return {
     inline_keyboard: [
       [
-        { text: "۳۰ روزه", callback_data: "ADMIN_DAYS_30" },
-        { text: "۶۰ روزه", callback_data: "ADMIN_DAYS_60" },
-        { text: "۹۰ روزه", callback_data: "ADMIN_DAYS_90" }
+        { text: "۳۰ روزه", callback_data: "dur_30" },
+        { text: "۶۰ روزه", callback_data: "dur_60" },
+        { text: "۹۰ روزه", callback_data: "dur_90" }
       ],
-      [{ text: "مدت دلخواه", callback_data: "ADMIN_CUSTOM_DAYS" }]
+      [{ text: "مدت دلخواه", callback_data: "dur_custom" }],
+      [{ text: "برگشت ↩️", callback_data: "back_menu" }]
     ]
   };
-
-  return tgSendMessage(
-    env,
-    chatId,
-    "⏳ مدت اشتراک رو انتخاب کن:",
-    { reply_markup: inline }
-  );
 }
 
-// ======================= Subscription Logic =======================
-async function redeemCode(env, chatId, userId, codeInput) {
-  const codeRow = await env.DB.prepare(
-    `SELECT code, days, used_by FROM codes WHERE code=?`
-  ).bind(codeInput).first();
+function deleteMenuKeyboard(codes) {
+  const rows = codes.map(c => ([
+    { text: `${c.code} (${c.days} روزه)`, callback_data: `delcode_${c.code}` }
+  ]));
+  rows.push([{ text: "برگشت ↩️", callback_data: "back_menu" }]);
+  return { inline_keyboard: rows };
+}
 
-  if (!codeRow) {
-    return tgSendMessage(env, chatId, "❌ این کد وجود نداره.");
-  }
-  if (codeRow.used_by) {
-    return tgSendMessage(env, chatId, "⚠️ این کد قبلاً استفاده شده.");
-  }
+function randomDigits(len = 30) {
+  let s = "";
+  for (let i = 0; i < len; i++) s += Math.floor(Math.random() * 10);
+  return s;
+}
 
-  const now = Date.now();
-  const expiresAt = now + codeRow.days * 24 * 60 * 60 * 1000;
+// ----------------------
+// State (D1)
+// ----------------------
 
-  // ثبت اشتراک
+async function setState(env, user_id, state) {
   await env.DB.prepare(
-    `INSERT INTO subscriptions (user_id, expires_at) VALUES (?, ?)
+    `INSERT INTO user_state (user_id, state)
+     VALUES (?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET state=excluded.state`
+  ).bind(user_id, state).run();
+}
+
+async function getState(env, user_id) {
+  const r = await env.DB.prepare(
+    `SELECT state FROM user_state WHERE user_id=?`
+  ).bind(user_id).first();
+  return r?.state || null;
+}
+
+async function clearState(env, user_id) {
+  await env.DB.prepare(`DELETE FROM user_state WHERE user_id=?`)
+    .bind(user_id).run();
+}
+
+// ----------------------
+// DB ops
+// ----------------------
+
+async function getSubscription(env, user_id) {
+  return env.DB.prepare(
+    `SELECT expires_at FROM subscriptions WHERE user_id=?`
+  ).bind(user_id).first();
+}
+
+async function upsertSubscription(env, user_id, expires_at) {
+  await env.DB.prepare(
+    `INSERT INTO subscriptions (user_id, expires_at)
+     VALUES (?, ?)
      ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at`
-  ).bind(userId, expiresAt).run();
-
-  // مصرف کد
-  await env.DB.prepare(
-    `UPDATE codes SET used_by=?, used_at=? WHERE code=?`
-  ).bind(userId, now, codeInput).run();
-
-  const invite = await tgCreateInvite(env, expiresAt);
-
-  return tgSendMessage(
-    env,
-    chatId,
-    "✅ اشتراک شما فعال شد!\n\n" +
-      `⏳ مدت: ${codeRow.days} روز\n` +
-      `📅 اعتبار تا: ${formatTehran(expiresAt)}\n\n` +
-      "🔗 لینک ورود کانال:",
-    {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🚀 ورود به کانال VIP", url: invite }]]
-      }
-    }
-  );
+  ).bind(user_id, expires_at).run();
 }
 
-async function showMyStatus(env, chatId, userId) {
-  const sub = await env.DB.prepare(
-    `SELECT expires_at FROM subscriptions WHERE user_id=?`
-  ).bind(userId).first();
-
-  if (!sub) {
-    return tgSendMessage(env, chatId, "❌ هیچ اشتراک فعالی نداری.");
-  }
-
-  const now = Date.now();
-  const remainingMs = sub.expires_at - now;
-
-  if (remainingMs <= 0) {
-    await env.DB.prepare(`DELETE FROM subscriptions WHERE user_id=?`).bind(userId).run();
-    return tgSendMessage(env, chatId, "❌ اشتراک شما منقضی شده.");
-  }
-
-  const remainingDays = Math.ceil(remainingMs / (24 * 60 * 60 * 1000));
-
-  return tgSendMessage(
-    env,
-    chatId,
-    "📌 وضعیت اشتراک شما:\n\n" +
-      `✅ فعال\n` +
-      `⏳ روزهای باقی‌مانده: ${remainingDays}\n` +
-      `📅 تاریخ انقضا: ${formatTehran(sub.expires_at)}`
-  );
-}
-
-async function sendMyInvite(env, chatId, userId) {
-  const sub = await env.DB.prepare(
-    `SELECT expires_at FROM subscriptions WHERE user_id=?`
-  ).bind(userId).first();
-
-  if (!sub || sub.expires_at <= Date.now()) {
-    return tgSendMessage(env, chatId, "❌ اشتراک فعالی نداری.");
-  }
-
-  const invite = await tgCreateInvite(env, sub.expires_at);
-
-  return tgSendMessage(
-    env,
-    chatId,
-    "🔗 لینک ورود اختصاصی شما به کانال:",
-    {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🚀 ورود به کانال VIP", url: invite }]]
-      }
-    }
-  );
-}
-
-async function deleteMySubscription(env, chatId, userId) {
+async function deleteSubscription(env, user_id) {
   await env.DB.prepare(`DELETE FROM subscriptions WHERE user_id=?`)
-    .bind(userId).run();
-
-  return tgSendMessage(env, chatId, "🗑 اشتراک شما حذف شد.");
+    .bind(user_id).run();
 }
 
-// ======================= Admin Code Creation =======================
-async function createCodeForAdmin(env, chatId, days) {
-  const code = generateCode(30);
-  const now = Date.now();
-
+async function insertCode(env, code, days) {
+  const created_at = Math.floor(Date.now() / 1000);
   await env.DB.prepare(
     `INSERT INTO codes (code, days, created_at, used_by, used_at)
      VALUES (?, ?, ?, NULL, NULL)`
-  ).bind(code, days, now).run();
-
-  return tgSendMessage(
-    env,
-    chatId,
-    "✅ کد جدید ساخته شد:\n\n" +
-      `🔑 <code>${code}</code>\n` +
-      `⏳ مدت: ${days} روز\n` +
-      `🕒 زمان ساخت: ${formatTehran(now)}`,
-    { parse_mode: "HTML" }
-  );
+  ).bind(code, days, created_at).run();
 }
 
-// ======================= Cron: expire check =======================
-async function checkExpiredSubs(env) {
-  await ensureTables(env);
-
-  const now = Date.now();
-  const { results } = await env.DB.prepare(
-    `SELECT user_id, expires_at FROM subscriptions`
-  ).all();
-
-  for (const s of results) {
-    if (s.expires_at <= now) {
-      // بن از کانال
-      await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/banChatMember`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: env.CHANNEL_ID,
-          user_id: s.user_id,
-          revoke_messages: false
-        })
-      });
-
-      // پیام به کاربر
-      await tgSendMessage(
-        env,
-        s.user_id,
-        "⛔️ اشتراک شما تمام شد و از کانال خارج شدید.\n" +
-          "برای تمدید، کد جدید تهیه کنید."
-      );
-
-      // حذف رکورد
-      await env.DB.prepare(
-        `DELETE FROM subscriptions WHERE user_id=?`
-      ).bind(s.user_id).run();
-    }
-  }
-}
-
-// ======================= Helpers =======================
-function generateCode(len = 30) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz0123456789";
-  let out = "";
-  const arr = new Uint8Array(len);
-  crypto.getRandomValues(arr);
-  for (let i = 0; i < len; i++) {
-    out += alphabet[arr[i] % alphabet.length];
-  }
-  return out;
-}
-
-function isAdmin(env, userId) {
-  return String(userId) === String(env.ADMIN_ID);
-}
-
-function formatTehran(ts) {
-  return new Date(ts).toLocaleString("fa-IR", {
-    timeZone: "Asia/Tehran",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit"
-  });
-}
-
-// ======================= State =======================
-async function getUserState(env, userId) {
-  const row = await env.DB.prepare(
-    `SELECT state FROM user_state WHERE user_id=?`
-  ).bind(userId).first();
-  return row?.state || null;
-}
-
-async function setUserState(env, userId, state) {
+async function markCodeUsed(env, code, user_id) {
+  const used_at = Math.floor(Date.now() / 1000);
   await env.DB.prepare(
-    `INSERT INTO user_state (user_id, state) VALUES (?, ?)
-     ON CONFLICT(user_id) DO UPDATE SET state=excluded.state`
-  ).bind(userId, state).run();
+    `UPDATE codes
+     SET used_by=?, used_at=?
+     WHERE code=? AND used_by IS NULL`
+  ).bind(user_id, used_at, code).run();
 }
 
-async function clearUserState(env, userId) {
-  await env.DB.prepare(`DELETE FROM user_state WHERE user_id=?`)
-    .bind(userId).run();
+async function getValidCode(env, code) {
+  return env.DB.prepare(
+    `SELECT code, days, used_by FROM codes WHERE code=?`
+  ).bind(code).first();
 }
 
-// ======================= DB Init =======================
-async function ensureTables(env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS codes (
-      code TEXT PRIMARY KEY,
-      days INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      used_by INTEGER,
-      used_at INTEGER
-    );
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      user_id INTEGER PRIMARY KEY,
-      expires_at INTEGER NOT NULL
-    );
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS user_state (
-      user_id INTEGER PRIMARY KEY,
-      state TEXT
-    );
-  `).run();
+async function listUnusedCodes(env) {
+  const res = await env.DB.prepare(
+    `SELECT code, days, created_at, used_by, used_at
+     FROM codes
+     WHERE used_by IS NULL
+     ORDER BY created_at DESC
+     LIMIT 50`
+  ).all();
+  return res.results || [];
 }
 
-// ======================= Telegram API Helpers =======================
-async function tgSendMessage(env, chatId, text, extra = {}) {
-  const payload = {
-    chat_id: chatId,
-    text,
-    parse_mode: extra.parse_mode || "Markdown",
-    disable_web_page_preview: true,
-    ...extra
-  };
+// ----------------------
+// Handlers
+// ----------------------
 
-  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-}
+async function onMessage(msg, env) {
+  const chat_id = msg.chat.id;
+  const user_id = msg.from?.id;
+  const text = (msg.text || "").trim();
+  const isAdmin = String(user_id) === String(env.ADMIN_ID);
 
-async function tgAnswerCallback(env, callbackId) {
-  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ callback_query_id: callbackId })
-  });
-}
+  if (text === "/start") {
+    await clearState(env, user_id);
 
-async function tgCreateInvite(env, expiresAt) {
-  // زمان انقضا به ثانیه
-  const expireDate = Math.floor(expiresAt / 1000);
+    const welcome =
+`✨ به ربات VIP کانال <b>TITAN X</b> خوش اومدی!
 
-  const res = await fetch(
-    `https://api.telegram.org/bot${env.BOT_TOKEN}/createChatInviteLink`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.CHANNEL_ID,
-        expire_date: expireDate,
-        member_limit: 1,
-        creates_join_request: false
-      })
+اینجا می‌تونی:
+✅ اشتراک VIP رو فعال کنی
+📌 وضعیت اشتراکت رو ببینی
+🧾 لینک ورود به کانال بگیری
+👨‍💻 با ادمین چت کنی
+
+<b>⏰ زمان تهران:</b> ${tehranNowFa()}
+
+از منو یکی رو انتخاب کن 👇`;
+
+    await sendMessage(env, chat_id, welcome, {
+      reply_markup: mainMenuKeyboard(isAdmin)
+    });
+    return;
+  }
+
+  const state = await getState(env, user_id);
+
+  if (state === "WAIT_CODE") {
+    const code = text;
+    const row = await getValidCode(env, code);
+
+    if (!row) {
+      await sendMessage(env, chat_id, "❌ این کد معتبر نیست. دوباره بفرست:");
+      return;
     }
-  );
+    if (row.used_by) {
+      await sendMessage(env, chat_id, "❌ این کد قبلاً استفاده شده.");
+      await clearState(env, user_id);
+      return;
+    }
 
-  const j = await res.json();
-  if (!j.ok) throw new Error("createChatInviteLink failed: " + JSON.stringify(j));
+    const days = row.days;
+    const now = Math.floor(Date.now() / 1000);
+    const expires_at = now + days * 86400;
 
-  return j.result.invite_link;
-}
+    await markCodeUsed(env, code, user_id);
+    await upsertSubscription(env, user_id, expires_at);
+    await clearState(env, user_id);
 
-async function contactAdmin(env, chatId) {
-  // deep-link مستقیم به چت ادمین (موبایل کار می‌کند)
-  const url = `tg://user?id=${env.ADMIN_ID}`;
+    await sendMessage(
+      env,
+      chat_id,
+      `✅ اشتراک فعال شد!\n\n📆 مدت: <b>${days}</b> روز\n📌 انقضا: <b>${new Date(expires_at * 1000).toLocaleString("fa-IR",{timeZone:"Asia/Tehran"})}</b>`
+    );
+    return;
+  }
 
-  return tgSendMessage(
-    env,
-    chatId,
-    "برای ارتباط مستقیم با ادمین روی دکمه زیر بزن 👇",
-    {
+  if (state === "ADMIN_WAIT_DAYS") {
+    const days = parseInt(text, 10);
+    if (!days || days <= 0) {
+      await sendMessage(env, chat_id, "❌ فقط عدد روز بفرست. مثلا 45");
+      return;
+    }
+
+    const code = randomDigits(30);
+    await insertCode(env, code, days);
+    await clearState(env, user_id);
+
+    await sendMessage(env, chat_id,
+      `✅ کد ساخته شد:\n\n<code>${code}</code>\n📆 مدت: ${days} روز`
+    );
+    return;
+  }
+
+  if (text === "✅ فعال سازی اشتراک VIP") {
+    await setState(env, user_id, "WAIT_CODE");
+    await sendMessage(env, chat_id, "🔑 کد اشتراک رو بفرست:");
+    return;
+  }
+
+  if (text === "📌 وضعیت اشتراک من") {
+    const sub = await getSubscription(env, user_id);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!sub || sub.expires_at <= now) {
+      if (sub) await deleteSubscription(env, user_id);
+      await sendMessage(env, chat_id, "❌ هیچ اشتراک فعالی نداری.");
+      return;
+    }
+
+    const leftDays = Math.ceil((sub.expires_at - now) / 86400);
+    await sendMessage(env, chat_id,
+      `✅ اشتراک فعاله.\n⏳ باقی‌مانده: <b>${leftDays}</b> روز\n📌 انقضا: <b>${new Date(sub.expires_at*1000).toLocaleString("fa-IR",{timeZone:"Asia/Tehran"})}</b>`
+    );
+    return;
+  }
+
+  if (text === "🧾 دریافت اشتراک کانال") {
+    const sub = await getSubscription(env, user_id);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!sub || sub.expires_at <= now) {
+      await sendMessage(env, chat_id, "❌ اول اشتراک VIP رو فعال کن.");
+      return;
+    }
+
+    const inviteRes = await tg(env, "createChatInviteLink", {
+      chat_id: env.CHANNEL_ID,
+      expire_date: now + 3600,
+      member_limit: 1
+    });
+
+    if (inviteRes.ok) {
+      await sendMessage(env, chat_id,
+        `✅ لینک یکبارمصرف:\n\n${inviteRes.result.invite_link}\n\n⏳ اعتبار: ۱ ساعت`
+      );
+    } else {
+      await sendMessage(env, chat_id,
+        "❌ ربات ادمین کانال نیست یا دسترسی ساخت لینک نداره."
+      );
+    }
+    return;
+  }
+
+  if (text === "👨‍💻 ارتباط با ادمین") {
+    await sendMessage(env, chat_id, "روی دکمه زیر بزن 👇", {
       reply_markup: {
-        inline_keyboard: [[{ text: "👨‍💻 چت با ادمین", url }]]
+        inline_keyboard: [
+          [{ text: "💬 چت با ادمین", url: `tg://user?id=${env.ADMIN_ID}` }]
+        ]
       }
+    });
+    return;
+  }
+
+  if (text === "🛠 ساخت کد جدید (ادمین)") {
+    if (!isAdmin) {
+      await sendMessage(env, chat_id, "⛔️ فقط ادمین.");
+      return;
     }
-  );
+    await sendMessage(env, chat_id, "مدت اشتراک رو انتخاب کن:", {
+      reply_markup: durationKeyboard()
+    });
+    return;
+  }
+
+  if (text === "🗑 حذف اشتراک") {
+    if (!isAdmin) return;
+
+    const codes = await listUnusedCodes(env);
+    if (codes.length === 0) {
+      await sendMessage(env, chat_id, "کدی برای حذف نیست.");
+      return;
+    }
+
+    await sendMessage(env, chat_id, "کد رو انتخاب کن:", {
+      reply_markup: deleteMenuKeyboard(codes)
+    });
+    return;
+  }
+
+  await sendMessage(env, chat_id, "از منو انتخاب کن 👇", {
+    reply_markup: mainMenuKeyboard(isAdmin)
+  });
+}
+
+async function onCallback(q, env) {
+  const chat_id = q.message.chat.id;
+  const user_id = q.from.id;
+  const data = q.data || "";
+  const isAdmin = String(user_id) === String(env.ADMIN_ID);
+
+  await tg(env, "answerCallbackQuery", { callback_query_id: q.id });
+
+  if (data === "back_menu") {
+    await clearState(env, user_id);
+    await sendMessage(env, chat_id, "منوی اصلی:", {
+      reply_markup: mainMenuKeyboard(isAdmin)
+    });
+    return;
+  }
+
+  if (data.startsWith("dur_")) {
+    if (!isAdmin) return;
+
+    if (data === "dur_custom") {
+      await setState(env, user_id, "ADMIN_WAIT_DAYS");
+      await sendMessage(env, chat_id, "عدد روز دلخواه رو بفرست. مثال 45");
+      return;
+    }
+
+    let days = 30;
+    if (data === "dur_60") days = 60;
+    if (data === "dur_90") days = 90;
+
+    const code = randomDigits(30);
+    await insertCode(env, code, days);
+
+    await sendMessage(env, chat_id,
+      `✅ کد ${days} روزه:\n\n<code>${code}</code>`
+    );
+    return;
+  }
+
+  if (data.startsWith("delcode_")) {
+    if (!isAdmin) return;
+    const code = data.replace("delcode_", "");
+
+    await env.DB.prepare(
+      `DELETE FROM codes WHERE code=? AND used_by IS NULL`
+    ).bind(code).run();
+
+    await sendMessage(env, chat_id, `✅ حذف شد:\n<code>${code}</code>`);
+  }
 }
