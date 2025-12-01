@@ -1,4 +1,4 @@
-name = "titan-vip-bot"
+name = "titanvip"
 main = "worker.js"
 compatibility_date = "2025-12-01"
 
