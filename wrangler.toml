@@ -6,3 +6,11 @@ compatibility_date = "2025-12-01"
 binding = "DB"
 database_name = "vip_db"
 database_id = "d2c95304-7a14-4e96-b3db-94f8b160e9d4"
+
+[triggers]
+crons = [
+  "30 20 * * *",  # 20:30 UTC = 00:00 Tehran
+  "30 2  * * *",  # 02:30 UTC = 06:00 Tehran
+  "30 8  * * *",  # 08:30 UTC = 12:00 Tehran
+  "30 14 * * *"   # 14:30 UTC = 18:00 Tehran
+]
