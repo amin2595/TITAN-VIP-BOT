@@ -1,0 +1,8 @@
+name = "titan-vip-bot"
+main = "worker.js"
+compatibility_date = "2025-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vip_db"
+database_id = "دیتابیس آی‌دی خودت"
