@@ -82,27 +82,6 @@ async function handleCallback(cb, env) {
     return sendUserStatus(env, chatId, userId);
   }
 
-  if (data === "USER_BUY") {
-    return tgSendMessage(
-      env,
-      chatId,
-      "💳 برای دریافت اشتراک VIP کانال **TITAN X**:\n\n" +
-      "1) به ادمین پیام بده و پلن رو انتخاب کن (30/60/90 روزه)\n" +
-      "2) بعد از پرداخت، ادمین یک کد ۲۰ کاراکتری بهت میده\n" +
-      "3) کد رو همینجا بفرست تا اشتراک فعال بشه ✅",
-      null,
-      "Markdown"
-    );
-  }
-
-  if (data === "USER_CONTACT_ADMIN") {
-    const username = (env.ADMIN_USERNAME || "").trim();
-    const contactText = username
-      ? `👨‍💻 برای ارتباط با ادمین روی لینک زیر بزن:\nhttps://t.me/${username}`
-      : "👨‍💻 برای ارتباط با ادمین پیام بده:\nآیدی ادمین: 175438306";
-    return tgSendMessage(env, chatId, contactText);
-  }
-
   // -------- Admin buttons --------
   if (isAdmin(userId, env)) {
     if (data === "ADMIN_CREATE") {
@@ -134,11 +113,19 @@ async function handleCallback(cb, env) {
 // ================== Menus ==================
 
 async function showMainMenu(env, chatId, userId) {
+  // URL for admin chat:
+  // 1) If ADMIN_USERNAME exists -> use https://t.me/username
+  // 2) else fallback to tg://user?id=ADMIN_ID (opens chat in Telegram)
+  const adminUrl =
+    env.ADMIN_USERNAME && env.ADMIN_USERNAME.trim()
+      ? `https://t.me/${env.ADMIN_USERNAME.trim()}`
+      : `tg://user?id=${env.ADMIN_ID}`;
+
   const keyboard = [
     [{ text: "✅ فعال‌سازی اشتراک VIP", callback_data: "USER_REDEEM" }],
     [{ text: "📌 وضعیت اشتراک من", callback_data: "USER_STATUS" }],
-    [{ text: "💳 دریافت اشتراک کانال", callback_data: "USER_BUY" }],
-    [{ text: "👨‍💻 ارتباط با ادمین", callback_data: "USER_CONTACT_ADMIN" }]
+    [{ text: "💳 دریافت اشتراک کانال", url: adminUrl }],
+    [{ text: "👨‍💻 ارتباط با ادمین", url: adminUrl }]
   ];
 
   if (isAdmin(userId, env)) {
@@ -185,7 +172,9 @@ async function createCodeForAdmin(env, chatId, days) {
   return tgSendMessage(
     env,
     chatId,
-    `✅ کد VIP ساخته شد:\n<code>${code}</code>\n⏳ مدت: ${days} روز`
+    `✅ کد VIP ساخته شد:\n<code>${code}</code>\n⏳ مدت: ${days} روز`,
+    null,
+    "HTML"
   );
 }
 
@@ -282,9 +271,7 @@ async function handleChatMember(chatMemberUpdate, env) {
       user.id,
       "🌟 خوش اومدی به کانال **TITAN X**!\n\n" +
       "از امروز عضوی از جمع VIP ما هستی 🚀\n" +
-      "اگر مشکلی داشتی یا سوالی بود، همینجا بهم پیام بده.",
-      null,
-      "Markdown"
+      "اگر مشکلی داشتی یا سوالی بود، همینجا بهم پیام بده."
     );
   }
 }
@@ -313,7 +300,7 @@ async function checkExpiredSubs(env) {
         env,
         s.user_id,
         "⛔️ اشتراک VIP شما تمام شد و دسترسی‌تان به کانال TITAN X قطع شد.\n" +
-        "برای تمدید، کد جدید تهیه کنید."
+        "برای تمدید، با ادمین در ارتباط باشید."
       );
 
       await env.DB.prepare(
