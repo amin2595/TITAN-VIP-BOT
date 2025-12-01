@@ -1,14 +1,10 @@
 export default {
   async fetch(request, env, ctx) {
     try {
-      if (request.method !== "POST") {
-        return new Response("OK", { status: 200 });
-      }
+      if (request.method !== "POST") return new Response("OK");
 
       const update = await request.json();
-      if (!update.message && !update.callback_query) {
-        return new Response("OK", { status: 200 });
-      }
+      if (!update.message && !update.callback_query) return new Response("OK");
 
       const BOT_TOKEN = env.BOT_TOKEN;
       const ADMIN_ID = Number(env.ADMIN_ID);
@@ -20,433 +16,400 @@ export default {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        });
+        }).then(r => r.json());
 
-      const sendMessage = (chat_id, text, extra = {}) =>
-        api("sendMessage", { chat_id, text, ...extra });
-
-      const answerCb = (cb_id) =>
-        api("answerCallbackQuery", { callback_query_id: cb_id });
-
-      const nowSec = () => Math.floor(Date.now() / 1000);
-
-      // -------------------------
-      // Ensure tables exist
-      // -------------------------
-      async function ensureTables() {
+      // --- ensure table exists ---
+      const ensureTables = async () => {
         await DB.exec(`
           CREATE TABLE IF NOT EXISTS subscriptions (
             user_id INTEGER PRIMARY KEY,
-            expires_at INTEGER NOT NULL
-          );
-
-          CREATE TABLE IF NOT EXISTS codes (
-            code TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
             days INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            used_by INTEGER,
-            used_at INTEGER
+            created_at INTEGER NOT NULL
           );
-
-          CREATE TABLE IF NOT EXISTS user_state (
+          CREATE TABLE IF NOT EXISTS pending_actions (
             user_id INTEGER PRIMARY KEY,
-            state TEXT
+            action TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
           );
         `);
-      }
+      };
       await ensureTables();
 
-      // -------------------------
-      // Keyboards
-      // -------------------------
-      function userKeyboard() {
-        return {
-          keyboard: [
-            [{ text: "✅ فعال سازی اشتراک VIP" }],
-            [{ text: "📌 وضعیت اشتراک من" }],
-            [{ text: "🧾 فعالسازی با کد اشتراک" }],
-            [{ text: "👨‍💻 ارتباط با ادمین" }],
-          ],
-          resize_keyboard: true,
-          one_time_keyboard: false,
-        };
-      }
+      const now = () => Math.floor(Date.now() / 1000);
 
-      function adminKeyboard() {
-        return {
-          keyboard: [
-            [{ text: "✅ فعال سازی اشتراک VIP" }],
-            [{ text: "📌 وضعیت اشتراک من" }],
-            [{ text: "🧾 فعالسازی با کد اشتراک" }],
-            [{ text: "👨‍💻 ارتباط با ادمین" }],
-            [{ text: "🛠 ساخت کد جدید (ادمین)" }],
-            [{ text: "📋 لیست اشتراک‌ها (ادمین)" }],
-            [{ text: "🗑 حذف اشتراک کاربر (ادمین)" }],
-          ],
-          resize_keyboard: true,
-          one_time_keyboard: false,
-        };
-      }
+      // --- helpers ---
+      const isAdmin = (id) => Number(id) === ADMIN_ID;
 
-      function daysInlineKeyboard() {
-        return {
-          inline_keyboard: [
-            [
-              { text: "30 روزه", callback_data: "days_30" },
-              { text: "60 روزه", callback_data: "days_60" },
-              { text: "90 روزه", callback_data: "days_90" },
-            ],
-            [{ text: "مدت دلخواه", callback_data: "days_custom" }],
-          ],
-        };
-      }
+      const sendMainMenu = async (chatId) => {
+        const keyboardUser = [
+          [{ text: "✅ فعال سازی اشتراک VIP" }],
+          [{ text: "📌 وضعیت اشتراک من" }],
+          [{ text: "🧾 دریافت اشتراک" }],
+          [{ text: "👨‍💻 ارتباط با ادمین" }],
+        ];
 
-      function confirmDeleteKeyboard(targetId) {
-        return {
-          inline_keyboard: [
-            [
-              { text: "✅ تایید حذف", callback_data: `del_yes_${targetId}` },
-              { text: "❌ لغو", callback_data: "del_no" },
-            ],
-          ],
-        };
-      }
+        const keyboardAdmin = [
+          [{ text: "🛠 ساخت کد جدید (ادمین)" }],
+          [{ text: "📋 لیست اشتراک‌ها (ادمین)" }],
+          [{ text: "🗑 حذف اشتراک (ادمین)" }],
+        ];
 
-      // -------------------------
-      // /start (welcome + hide admin buttons)
-      // -------------------------
-      if (update.message?.text?.startsWith("/start")) {
+        const kb = isAdmin(chatId)
+          ? keyboardUser.concat(keyboardAdmin)
+          : keyboardUser;
+
+        await api("sendMessage", {
+          chat_id: chatId,
+          text:
+            "به ربات VIP TITAN X خوش اومدی! 🟢\n\n" +
+            "از منو انتخاب کن 👇",
+          reply_markup: {
+            keyboard: kb,
+            resize_keyboard: true,
+            one_time_keyboard: false,
+          },
+        });
+      };
+
+      const getSub = async (userId) => {
+        const res = await DB.prepare(
+          "SELECT * FROM subscriptions WHERE user_id = ?"
+        ).bind(userId).first();
+        return res || null;
+      };
+
+      const setSub = async (userId, days) => {
+        const exp = now() + days * 86400;
+        await DB.prepare(
+          `INSERT INTO subscriptions (user_id, expires_at, days, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             expires_at=excluded.expires_at,
+             days=excluded.days`
+        ).bind(userId, exp, days, now()).run();
+        return exp;
+      };
+
+      const deleteSub = async (userId) => {
+        await DB.prepare("DELETE FROM subscriptions WHERE user_id=?")
+          .bind(userId).run();
+      };
+
+      const fmtDate = (unix) => {
+        const d = new Date(unix * 1000);
+        return d.toLocaleString("fa-IR");
+      };
+
+      const setPending = async (userId, action, payloadObj = null) => {
+        await DB.prepare(
+          `INSERT INTO pending_actions (user_id, action, payload, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             action=excluded.action, payload=excluded.payload, created_at=excluded.created_at`
+        ).bind(userId, action, payloadObj ? JSON.stringify(payloadObj) : null, now()).run();
+      };
+
+      const getPending = async (userId) => {
+        return await DB.prepare(
+          "SELECT * FROM pending_actions WHERE user_id=?"
+        ).bind(userId).first();
+      };
+
+      const clearPending = async (userId) => {
+        await DB.prepare("DELETE FROM pending_actions WHERE user_id=?")
+          .bind(userId).run();
+      };
+
+      // ------------ message handling ------------
+      if (update.message) {
         const chatId = update.message.chat.id;
-        const userId = update.message.from.id;
+        const text = update.message.text?.trim();
 
-        const kb = (userId === ADMIN_ID) ? adminKeyboard() : userKeyboard();
+        // /start
+        if (text === "/start") {
+          await sendMainMenu(chatId);
+          return new Response("OK");
+        }
 
-        ctx.waitUntil(
-          sendMessage(
-            chatId,
-            "✨ به ربات VIP کانال <b>TITAN X</b> خوش اومدی! 👋\n\n" +
-              "از منو انتخاب کن 👇",
-            { parse_mode: "HTML", reply_markup: kb }
-          )
-        );
+        // --- user menu ---
+        if (text === "✅ فعال سازی اشتراک VIP") {
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: "مدت اشتراک رو انتخاب کن:",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "30 روزه", callback_data: "days_30" }],
+                [{ text: "60 روزه", callback_data: "days_60" }],
+                [{ text: "90 روزه", callback_data: "days_90" }],
+                [{ text: "مدت دلخواه", callback_data: "days_custom" }],
+              ],
+            },
+          });
+          return new Response("OK");
+        }
 
-        return new Response("OK");
-      }
+        if (text === "📌 وضعیت اشتراک من") {
+          const sub = await getSub(chatId);
+          if (!sub) {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "اشتراکی برات ثبت نشده ❌",
+            });
+          } else {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text:
+                `✅ اشتراک فعال داری\n` +
+                `مدت: ${sub.days} روز\n` +
+                `تاریخ پایان: ${fmtDate(sub.expires_at)}`
+            });
+          }
+          return new Response("OK");
+        }
 
-      // -------------------------
-      // Callback queries (buttons)
-      // -------------------------
-      if (update.callback_query) {
-        const cq = update.callback_query;
-        const data = cq.data;
-        const chatId = cq.message.chat.id;
-        const userId = cq.from.id;
+        if (text === "🧾 دریافت اشتراک") {
+          const sub = await getSub(chatId);
+          if (!sub) {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "اول اشتراک رو فعال کن.",
+            });
+          } else {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text:
+                "اشتراک شما فعاله ✅\n" +
+                "لینک/فایل‌های VIP رو از ادمین بگیر.",
+            });
+          }
+          return new Response("OK");
+        }
 
-        ctx.waitUntil(answerCb(cq.id));
+        if (text === "👨‍💻 ارتباط با ادمین") {
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: "برای ارتباط با ادمین پیام بده:\n@YourAdminUsername",
+          });
+          return new Response("OK");
+        }
 
-        // انتخاب روزها برای فعال‌سازی
-        if (data.startsWith("days_")) {
-          if (data === "days_custom") {
-            await DB.prepare(
-              "INSERT OR REPLACE INTO user_state (user_id, state) VALUES (?, ?)"
-            ).bind(userId, "awaiting_custom_days").run();
+        // --- custom days input ---
+        const pending = await getPending(chatId);
+        if (pending?.action === "await_custom_days") {
+          const days = Number(text);
+          if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "عدد معتبر بفرست (مثلاً 45).",
+            });
+            return new Response("OK");
+          }
+          const exp = await setSub(chatId, days);
+          await clearPending(chatId);
 
-            ctx.waitUntil(
-              sendMessage(chatId, "تعداد روز دلخواه رو فقط عددی بفرست (مثلا 45):")
-            );
+          await api("sendMessage", {
+            chat_id: chatId,
+            text:
+              `✅ اشتراک ${days} روزه فعال شد.\n` +
+              `پایان: ${fmtDate(exp)}`,
+          });
+          await sendMainMenu(chatId);
+          return new Response("OK");
+        }
+
+        // ------------ admin-only ------------
+        if (text === "🛠 ساخت کد جدید (ادمین)" && isAdmin(chatId)) {
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: "این بخش بعداً اضافه میشه. (فعلاً placeholder)",
+          });
+          return new Response("OK");
+        }
+
+        if (text === "📋 لیست اشتراک‌ها (ادمین)" && isAdmin(chatId)) {
+          const rows = await DB.prepare(
+            "SELECT * FROM subscriptions ORDER BY expires_at DESC LIMIT 50"
+          ).all();
+
+          if (!rows.results.length) {
+            await api("sendMessage", { chat_id: chatId, text: "لیست خالیه." });
             return new Response("OK");
           }
 
-          const days = Number(data.split("_")[1]); // 30/60/90
-          const expiresAt = nowSec() + days * 86400;
+          const msg = rows.results.map(r =>
+            `👤 ${r.user_id} | ${r.days} روز | تا ${fmtDate(r.expires_at)}`
+          ).join("\n");
 
-          await DB.prepare(
-            "INSERT OR REPLACE INTO subscriptions (user_id, expires_at) VALUES (?, ?)"
-          ).bind(userId, expiresAt).run();
-
-          ctx.waitUntil(
-            sendMessage(chatId, `✅ اشتراک ${days} روزه فعال شد.`)
-          );
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: "📋 لیست اشتراک‌ها:\n\n" + msg
+          });
           return new Response("OK");
         }
 
-        // تایید حذف برای ادمین
-        if (data.startsWith("del_yes_")) {
-          if (userId !== ADMIN_ID) return new Response("OK");
-
-          const targetId = Number(data.replace("del_yes_", ""));
-          await DB.prepare("DELETE FROM subscriptions WHERE user_id=?")
-            .bind(targetId)
-            .run();
-
-          ctx.waitUntil(sendMessage(chatId, `✅ اشتراک کاربر ${targetId} حذف شد.`));
+        if (text === "🗑 حذف اشتراک (ادمین)" && isAdmin(chatId)) {
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: "آیدی عددی کاربر رو بفرست تا حذف کنم (مثلاً 12345678):",
+          });
+          await setPending(chatId, "await_delete_userid");
           return new Response("OK");
         }
 
-        if (data === "del_no") {
-          ctx.waitUntil(sendMessage(chatId, "لغو شد."));
+        if (pending?.action === "await_delete_userid" && isAdmin(chatId)) {
+          const targetId = Number(text);
+          if (!Number.isFinite(targetId)) {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "آیدی عددی معتبر بفرست.",
+            });
+            return new Response("OK");
+          }
+
+          await setPending(chatId, "confirm_delete", { targetId });
+
+          await api("sendMessage", {
+            chat_id: chatId,
+            text: `واقعا اشتراک ${targetId} حذف بشه؟`,
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "✅ بله حذف کن", callback_data: "admin_del_yes" },
+                  { text: "❌ نه", callback_data: "admin_del_no" }
+                ]
+              ]
+            }
+          });
           return new Response("OK");
         }
 
+        // fallback
+        await api("sendMessage", {
+          chat_id: chatId,
+          text: "از منو استفاده کن یا /start بزن.",
+        });
         return new Response("OK");
       }
 
-      // -------------------------
-      // Normal messages
-      // -------------------------
-      const text = update.message?.text?.trim();
-      const chatId = update.message?.chat?.id;
-      const userId = update.message?.from?.id;
+      // ------------ callback handling ------------
+      if (update.callback_query) {
+        const cq = update.callback_query;
+        const chatId = cq.message.chat.id;
+        const data = cq.data;
 
-      if (!text || !chatId || !userId) return new Response("OK");
+        // user selects days
+        if (data?.startsWith("days_")) {
+          if (data === "days_custom") {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "تعداد روز دلخواه رو عددی بفرست:",
+            });
+            await setPending(chatId, "await_custom_days");
+          } else {
+            const days = Number(data.split("_")[1]);
+            const exp = await setSub(chatId, days);
+            await api("sendMessage", {
+              chat_id: chatId,
+              text:
+                `✅ اشتراک ${days} روزه فعال شد.\n` +
+                `پایان: ${fmtDate(exp)}`,
+            });
+            await sendMainMenu(chatId);
+          }
 
-      const isAdmin = (userId === ADMIN_ID);
-
-      // ---- فعالسازی VIP با انتخاب مدت
-      if (text === "✅ فعال سازی اشتراک VIP") {
-        ctx.waitUntil(
-          sendMessage(chatId, "مدت اشتراک رو انتخاب کن:", {
-            reply_markup: daysInlineKeyboard(),
-          })
-        );
-        return new Response("OK");
-      }
-
-      // ---- وضعیت اشتراک من
-      if (text === "📌 وضعیت اشتراک من") {
-        const sub = await DB.prepare(
-          "SELECT expires_at FROM subscriptions WHERE user_id=?"
-        ).bind(userId).first();
-
-        if (!sub) {
-          ctx.waitUntil(sendMessage(chatId, "❌ هیچ اشتراک فعالی نداری."));
+          await api("answerCallbackQuery", { callback_query_id: cq.id });
           return new Response("OK");
         }
 
-        const remain = sub.expires_at - nowSec();
-        if (remain <= 0) {
-          ctx.waitUntil(sendMessage(chatId, "⚠️ اشتراک شما منقضی شده."));
+        // admin delete confirmation
+        if ((data === "admin_del_yes" || data === "admin_del_no") && isAdmin(chatId)) {
+          const pending = await getPending(chatId);
+          const payload = pending?.payload ? JSON.parse(pending.payload) : null;
+          const targetId = payload?.targetId;
+
+          if (data === "admin_del_no") {
+            await api("sendMessage", { chat_id: chatId, text: "لغو شد." });
+            await clearPending(chatId);
+            await api("answerCallbackQuery", { callback_query_id: cq.id });
+            return new Response("OK");
+          }
+
+          if (targetId) {
+            await deleteSub(targetId);
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: `✅ اشتراک ${targetId} حذف شد.`,
+            });
+          } else {
+            await api("sendMessage", {
+              chat_id: chatId,
+              text: "خطا: کاربر مشخص نیست.",
+            });
+          }
+
+          await clearPending(chatId);
+          await api("answerCallbackQuery", { callback_query_id: cq.id });
           return new Response("OK");
         }
 
-        const daysLeft = Math.ceil(remain / 86400);
-        ctx.waitUntil(
-          sendMessage(chatId, `✅ اشتراک فعاله.\n⏳ باقی‌مانده: ${daysLeft} روز`)
-        );
+        await api("answerCallbackQuery", { callback_query_id: cq.id });
         return new Response("OK");
       }
-
-      // ---- فعالسازی با کد اشتراک (کاربر کد می‌فرسته)
-      if (text === "🧾 فعالسازی با کد اشتراک") {
-        await DB.prepare(
-          "INSERT OR REPLACE INTO user_state (user_id, state) VALUES (?, ?)"
-        ).bind(userId, "awaiting_code").run();
-
-        ctx.waitUntil(sendMessage(chatId, "کد اشتراک رو بفرست:"));
-        return new Response("OK");
-      }
-
-      // ---- ارتباط با ادمین
-      if (text === "👨‍💻 ارتباط با ادمین") {
-        ctx.waitUntil(
-          sendMessage(chatId, "برای ارتباط با ادمین روی آیدی زیر پیام بده:\n@TitanAdmin")
-        );
-        return new Response("OK");
-      }
-
-      // ---- ساخت کد جدید (ادمین)
-      if (text === "🛠 ساخت کد جدید (ادمین)") {
-        if (!isAdmin) return new Response("OK");
-
-        await DB.prepare(
-          "INSERT OR REPLACE INTO user_state (user_id, state) VALUES (?, ?)"
-        ).bind(userId, "admin_awaiting_days").run();
-
-        ctx.waitUntil(sendMessage(chatId, "تعداد روز کد جدید رو بفرست (مثلا 30):"));
-        return new Response("OK");
-      }
-
-      // ---- لیست اشتراک‌ها (ادمین)
-      if (text === "📋 لیست اشتراک‌ها (ادمین)") {
-        if (!isAdmin) return new Response("OK");
-
-        const rows = await DB.prepare(
-          "SELECT user_id, expires_at FROM subscriptions ORDER BY expires_at DESC"
-        ).all();
-
-        if (!rows.results || rows.results.length === 0) {
-          ctx.waitUntil(sendMessage(chatId, "هیچ اشتراکی ثبت نشده."));
-          return new Response("OK");
-        }
-
-        const now = nowSec();
-        const msg = rows.results.map((r, i) => {
-          const left = r.expires_at - now;
-          const daysLeft = Math.max(0, Math.ceil(left / 86400));
-          const status = left > 0 ? "فعال" : "منقضی";
-          return `${i + 1}) ${r.user_id} — ${status} — ${daysLeft} روز`;
-        }).join("\n");
-
-        ctx.waitUntil(sendMessage(chatId, "📋 لیست اشتراک‌ها:\n\n" + msg));
-        return new Response("OK");
-      }
-
-      // ---- حذف اشتراک کاربر (ادمین) با تایید
-      if (text === "🗑 حذف اشتراک کاربر (ادمین)") {
-        if (!isAdmin) return new Response("OK");
-
-        await DB.prepare(
-          "INSERT OR REPLACE INTO user_state (user_id, state) VALUES (?, ?)"
-        ).bind(userId, "admin_awaiting_delete_id").run();
-
-        ctx.waitUntil(sendMessage(chatId, "آیدی عددی کاربر رو بفرست تا حذفش کنم:"));
-        return new Response("OK");
-      }
-
-      // -------------------------
-      // Handle states
-      // -------------------------
-      const stateRow = await DB.prepare(
-        "SELECT state FROM user_state WHERE user_id=?"
-      ).bind(userId).first();
-
-      const state = stateRow?.state;
-
-      // مدت دلخواه برای کاربر
-      if (state === "awaiting_custom_days") {
-        const days = Number(text);
-        if (!days || days <= 0) {
-          ctx.waitUntil(sendMessage(chatId, "عدد درست بفرست مثلا 15"));
-          return new Response("OK");
-        }
-
-        const expiresAt = nowSec() + days * 86400;
-        await DB.prepare(
-          "INSERT OR REPLACE INTO subscriptions (user_id, expires_at) VALUES (?, ?)"
-        ).bind(userId, expiresAt).run();
-
-        await DB.prepare("DELETE FROM user_state WHERE user_id=?")
-          .bind(userId).run();
-
-        ctx.waitUntil(sendMessage(chatId, `✅ اشتراک ${days} روزه فعال شد.`));
-        return new Response("OK");
-      }
-
-      // کاربر کد اشتراک می‌فرسته
-      if (state === "awaiting_code") {
-        const code = text;
-
-        const row = await DB.prepare(
-          "SELECT code, days, used_by FROM codes WHERE code=?"
-        ).bind(code).first();
-
-        if (!row) {
-          ctx.waitUntil(sendMessage(chatId, "❌ این کد معتبر نیست."));
-          return new Response("OK");
-        }
-        if (row.used_by) {
-          ctx.waitUntil(sendMessage(chatId, "⚠️ این کد قبلاً استفاده شده."));
-          return new Response("OK");
-        }
-
-        const expiresAt = nowSec() + row.days * 86400;
-
-        await DB.prepare(
-          "INSERT OR REPLACE INTO subscriptions (user_id, expires_at) VALUES (?, ?)"
-        ).bind(userId, expiresAt).run();
-
-        await DB.prepare(
-          "UPDATE codes SET used_by=?, used_at=? WHERE code=?"
-        ).bind(userId, nowSec(), code).run();
-
-        await DB.prepare("DELETE FROM user_state WHERE user_id=?")
-          .bind(userId).run();
-
-        ctx.waitUntil(sendMessage(chatId, `✅ اشتراک ${row.days} روزه فعال شد.`));
-        return new Response("OK");
-      }
-
-      // ادمین روز کد جدید می‌فرسته
-      if (state === "admin_awaiting_days") {
-        if (!isAdmin) return new Response("OK");
-
-        const days = Number(text);
-        if (!days || days <= 0) {
-          ctx.waitUntil(sendMessage(chatId, "عدد روز درست بفرست مثلا 30"));
-          return new Response("OK");
-        }
-
-        const code =
-          "TITAN-" +
-          Math.random().toString(36).substring(2, 6).toUpperCase() +
-          Math.random().toString(36).substring(2, 6).toUpperCase();
-
-        await DB.prepare(
-          "INSERT INTO codes (code, days, created_at) VALUES (?, ?, ?)"
-        ).bind(code, days, nowSec()).run();
-
-        await DB.prepare("DELETE FROM user_state WHERE user_id=?")
-          .bind(userId).run();
-
-        ctx.waitUntil(
-          sendMessage(chatId, `✅ کد ساخته شد:\n\n${code}\n\n⏳ مدت: ${days} روز`)
-        );
-        return new Response("OK");
-      }
-
-      // ادمین آیدی کاربر برای حذف می‌فرسته
-      if (state === "admin_awaiting_delete_id") {
-        if (!isAdmin) return new Response("OK");
-
-        const targetId = Number(text);
-        if (!Number.isFinite(targetId)) {
-          ctx.waitUntil(sendMessage(chatId, "فقط آیدی عددی بفرست."));
-          return new Response("OK");
-        }
-
-        await DB.prepare("DELETE FROM user_state WHERE user_id=?")
-          .bind(userId).run();
-
-        ctx.waitUntil(
-          sendMessage(
-            chatId,
-            `می‌خوای اشتراک کاربر ${targetId} حذف بشه؟`,
-            { reply_markup: confirmDeleteKeyboard(targetId) }
-          )
-        );
-        return new Response("OK");
-      }
-
-      // چیز ناشناخته
-      const kb = isAdmin ? adminKeyboard() : userKeyboard();
-      ctx.waitUntil(sendMessage(chatId, "از منو انتخاب کن 👇", { reply_markup: kb }));
 
       return new Response("OK");
-
     } catch (err) {
       return new Response("ERR: " + err.message, { status: 200 });
     }
   },
 
-  // -------------------------
-  // Cron: پاکسازی منقضی‌شده‌ها
-  // -------------------------
   async scheduled(event, env, ctx) {
     try {
+      const BOT_TOKEN = env.BOT_TOKEN;
+      const CHANNEL_ID = env.CHANNEL_ID;
       const DB = env.DB;
-      const now = Math.floor(Date.now() / 1000);
+      const nowTs = Math.floor(Date.now() / 1000);
 
-      await DB.exec(`
-        CREATE TABLE IF NOT EXISTS subscriptions (
-          user_id INTEGER PRIMARY KEY,
-          expires_at INTEGER NOT NULL
-        );
-      `);
+      const api = (method, body) =>
+        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(r => r.json());
 
-      await DB.prepare(
-        "DELETE FROM subscriptions WHERE expires_at <= ?"
-      ).bind(now).run();
+      // پیدا کردن منقضی‌ها
+      const expired = await DB.prepare(
+        "SELECT user_id FROM subscriptions WHERE expires_at <= ?"
+      ).bind(nowTs).all();
 
-    } catch (e) {}
+      if (expired.results.length) {
+        // حذف از دیتابیس
+        await DB.prepare(
+          "DELETE FROM subscriptions WHERE expires_at <= ?"
+        ).bind(nowTs).run();
+
+        // پیام به کاربرها + (اختیاری) بن/کیک از کانال
+        for (const r of expired.results) {
+          const uid = r.user_id;
+
+          // پیام به کاربر
+          await api("sendMessage", {
+            chat_id: uid,
+            text: "اشتراک شما منقضی شد ❌\nبرای تمدید از ربات اقدام کنید.",
+          });
+
+          // اگر می‌خوای از کانال هم حذف بشن اینو روشن نگه دار:
+          if (CHANNEL_ID) {
+            await api("banChatMember", {
+              chat_id: CHANNEL_ID,
+              user_id: uid,
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // عمداً خالی
+    }
   },
 };
