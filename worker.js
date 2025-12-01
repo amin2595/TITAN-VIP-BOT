@@ -17,7 +17,7 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  // Cron every 6 hours
+  // Cron every 1 hour
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkExpiredSubs(env));
   }
@@ -48,7 +48,7 @@ async function handleMessage(msg, env) {
     return showMainMenu(env, chatId, userId);
   }
 
-  // Admin can send a number for custom days (like 45)
+  // Admin: send number for custom days
   if (isAdmin(userId, env) && /^\d+$/.test(text)) {
     const days = parseInt(text, 10);
     if (days > 0 && days <= 3650) {
@@ -56,8 +56,8 @@ async function handleMessage(msg, env) {
     }
   }
 
-  // User sends 20-char code
-  if (/^[A-Za-z0-9]{20}$/.test(text)) {
+  // User: send 30-char code
+  if (/^[A-Za-z0-9]{30}$/.test(text)) {
     return redeemCode(env, chatId, userId, text);
   }
 
@@ -75,7 +75,7 @@ async function handleCallback(cb, env) {
 
   // -------- User buttons --------
   if (data === "USER_REDEEM") {
-    return tgSendMessage(env, chatId, "🔑 کد ۲۰ کاراکتری اشتراک رو همینجا بفرست تا فعالش کنم 🙂");
+    return tgSendMessage(env, chatId, "🔑 کد ۳۰ کاراکتری اشتراک رو همینجا بفرست تا فعالش کنم 🙂");
   }
 
   if (data === "USER_STATUS") {
@@ -113,9 +113,7 @@ async function handleCallback(cb, env) {
 // ================== Menus ==================
 
 async function showMainMenu(env, chatId, userId) {
-  // URL for admin chat:
-  // 1) If ADMIN_USERNAME exists -> use https://t.me/username
-  // 2) else fallback to tg://user?id=ADMIN_ID (opens chat in Telegram)
+  // Admin chat URL button
   const adminUrl =
     env.ADMIN_USERNAME && env.ADMIN_USERNAME.trim()
       ? `https://t.me/${env.ADMIN_USERNAME.trim()}`
@@ -138,9 +136,7 @@ async function showMainMenu(env, chatId, userId) {
     "اینجا می‌تونی اشتراکت رو فعال کنی و لینک ورود یک‌بارمصرف بگیری.\n" +
     "یکی از گزینه‌ها رو انتخاب کن 👇";
 
-  return tgSendMessage(env, chatId, welcome, {
-    inline_keyboard: keyboard
-  });
+  return tgSendMessage(env, chatId, welcome, { inline_keyboard: keyboard });
 }
 
 async function showAdminDaysMenu(env, chatId) {
@@ -161,12 +157,12 @@ async function showAdminDaysMenu(env, chatId) {
 // ================== Core DB Logic ==================
 
 async function createCodeForAdmin(env, chatId, days) {
-  const code = generate20CharCode();
+  const code = generate30CharCode();
   const now = Date.now();
 
   await env.DB.prepare(
-    `INSERT INTO codes (code, duration_days, created_at)
-     VALUES (?, ?, ?)`
+    `INSERT INTO codes (code, duration_days, created_at, consumed_by, consumed_at)
+     VALUES (?, ?, ?, NULL, NULL)`
   ).bind(code, days, now).run();
 
   return tgSendMessage(
@@ -199,7 +195,7 @@ async function redeemCode(env, chatId, userId, codeText) {
 
   let base = now;
   if (subRow && subRow.expires_at > now) {
-    base = subRow.expires_at; // extend existing
+    base = subRow.expires_at; // extend
   }
 
   const newExpiresAt = base + codeRow.duration_days * 24 * 60 * 60 * 1000;
@@ -271,7 +267,7 @@ async function handleChatMember(chatMemberUpdate, env) {
       user.id,
       "🌟 خوش اومدی به کانال **TITAN X**!\n\n" +
       "از امروز عضوی از جمع VIP ما هستی 🚀\n" +
-      "اگر مشکلی داشتی یا سوالی بود، همینجا بهم پیام بده."
+      "اگر سوالی داشتی، همینجا بهم پیام بده."
     );
   }
 }
@@ -299,7 +295,7 @@ async function checkExpiredSubs(env) {
       await tgSendMessage(
         env,
         s.user_id,
-        "⛔️ اشتراک VIP شما تمام شد و دسترسی‌تان به کانال TITAN X قطع شد.\n" +
+        "⛔️ اشتراک VIP شما تمام شد و دسترسی‌تان قطع شد.\n" +
         "برای تمدید، با ادمین در ارتباط باشید."
       );
 
@@ -345,7 +341,6 @@ async function adminDeleteSub(env, chatId, targetUserId, callbackId) {
   ).bind(targetUserId).run();
 
   await tgAnswerCallback(env, callbackId, "✅ اشتراک حذف شد");
-
   await tgSendMessage(env, chatId, `✅ اشتراک کاربر ${targetUserId} حذف شد.`);
 
   try {
@@ -377,12 +372,13 @@ function tehranDate(ts) {
   return new Date(ts).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
 }
 
-function generate20CharCode() {
+// 30-char code generator
+function generate30CharCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789";
   let out = "";
-  const arr = new Uint8Array(20);
+  const arr = new Uint8Array(30);
   crypto.getRandomValues(arr);
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 30; i++) {
     out += alphabet[arr[i] % alphabet.length];
   }
   return out;
@@ -418,8 +414,7 @@ async function tgCreateInvite(env) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         chat_id: env.CHANNEL_ID,
-        member_limit: 1,
-        creates_join_request: false
+        member_limit: 1
       })
     }
   );
